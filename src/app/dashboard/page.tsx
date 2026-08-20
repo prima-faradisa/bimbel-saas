@@ -27,7 +27,7 @@ export default function DashboardFull(){
       supabase.from("jadwal").select("*, kelas(name)"),
       supabase.from("inventory_items").select("*"),
       supabase.from("pos_transactions").select("*, siswa(nama_lengkap)").order("created_at",{ascending:false}).limit(20),
-      supabase.from("school_settings").select("*").limit(1).maybeSingle(),
+      supabase.from("school_settings").select("*").limit(1).single(),
     ])
     setInvoices(inv.data||[]); setStudents(sis.data||[]); setJadwal(jad.data||[]); setItems(it.data||[]); setPos(pt.data||[])
     if(sch.data){ setSchool(sch.data); setSchoolForm(sch.data) }
@@ -47,9 +47,9 @@ export default function DashboardFull(){
   async function checkout(){
     if(cart.length===0) return alert("Cart kosong")
     const total=cart.reduce((a,b)=>a+b.subtotal,0)
-    const tenant = (await supabase.from("tenants").select("id").eq("slug","bimbel-star").maybeSingle()).data
-    const branch = (await supabase.from("branches").select("id").eq("name","Cikarang Pusat").maybeSingle()).data
-    const { data: trx, error } = await supabase.from("pos_transactions").insert({ tenant_id: tenant?.id, branch_id: branch?.id, invoice_no: `POS-${Date.now().toString().slice(-6)}`, siswa_id: selectedSiswa||null, total, payment_method:"cash", status:"paid" }).select().maybeSingle()
+    const tenant = (await supabase.from("tenants").select("id").eq("slug","bimbel-star").single()).data
+    const branch = (await supabase.from("branches").select("id").eq("name","Cikarang Pusat").single()).data
+    const { data: trx, error } = await supabase.from("pos_transactions").insert({ tenant_id: tenant?.id, branch_id: branch?.id, invoice_no: `POS-${Date.now().toString().slice(-6)}`, siswa_id: selectedSiswa||null, total, payment_method:"cash", status:"paid" }).select().single()
     if(error) return alert(error.message)
     for(const c of cart){
       await supabase.from("pos_items").insert({ transaction_id:trx.id, item_id:c.id, qty:c.qty, price:c.sell_price, subtotal:c.subtotal })
@@ -63,7 +63,7 @@ export default function DashboardFull(){
     if(!confirm(`Konfirmasi lunas Rp ${total?.toLocaleString()} ?`)) return
     const { error } = await supabase.from("invoices").update({ status:'paid', paid_at: new Date().toISOString() }).eq('id', id)
     if(error) return alert(error.message)
-    const tenant = (await supabase.from("tenants").select("id").eq("slug","bimbel-star").maybeSingle()).data
+    const tenant = (await supabase.from("tenants").select("id").eq("slug","bimbel-star").single()).data
     await supabase.from("finance_ledger").insert({ tenant_id: tenant?.id, type:'income', category:'SPP', amount:total, description:`SPP Lunas ${id}`, reference_id:id })
     load()
   }
