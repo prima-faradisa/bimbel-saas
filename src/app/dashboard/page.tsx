@@ -1,141 +1,128 @@
 "use client"
 import { useEffect, useState, useMemo } from "react"
-import { createClient } from "@supabase/supabase-js"
-import { LayoutDashboard, GraduationCap, Users, Wallet, Plus, Search, Clock, MapPin, MessageCircle, Receipt, Zap, TrendingUp, CheckCircle2 } from "lucide-react"
+import { supabase } from "@/lib/supabase"
+import { useRole } from "@/hooks/useRole"
+import { Card, StatCard } from "@/components/ui/Card"
+import { useRouter } from "next/navigation"
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-)
-
-type Role = "admin"|"guru"|"ortu"|"finance"
-
-export default function DashboardFigma(){
-  const [role,setRole]=useState<Role>("finance")
+export default function DashboardFull(){
+  const router=useRouter()
+  const { role } = useRole()
+  const [tab,setTab]=useState("finance")
+  const [invoices,setInvoices]=useState<any[]>([])
   const [students,setStudents]=useState<any[]>([])
-  const [query,setQuery]=useState("")
-  const [showAdd,setShowAdd]=useState(false)
-  const [newName,setNewName]=useState("")
-  const [paper,setPaper]=useState<"58"|"80">("58")
+  const [jadwal,setJadwal]=useState<any[]>([])
+  const [items,setItems]=useState<any[]>([])
+  const [pos,setPos]=useState<any[]>([])
+  const [cart,setCart]=useState<any[]>([])
+  const [selectedSiswa,setSelectedSiswa]=useState("")
+  const [school,setSchool]=useState<any>({ name:"BIMBEL STAR", logo_url:"", alamat:"Cikarang Pusat", rekening_bca:"BCA 1234567890 a/n Gunawan", wa_cs:"0812-xxxx" })
+  const [schoolForm,setSchoolForm]=useState<any>({})
 
-  useEffect(()=>{ load() },[])
+  useEffect(()=>{ if(typeof window!=="undefined" &&!localStorage.getItem("bimbel_user")){ router.push("/"); return } load() },[])
   async function load(){
-    const {data}=await supabase.from("siswa").select("*, pembayaran(status,jumlah)").order("created_at",{ascending:false})
-    setStudents(data||[])
+    const [inv, sis, jad, it, pt, sch]=await Promise.all([
+      supabase.from("invoices").select("*, siswa(nama_lengkap, phone)").order("created_at",{ascending:false}),
+      supabase.from("siswa").select("*"),
+      supabase.from("jadwal").select("*, kelas(name)"),
+      supabase.from("inventory_items").select("*"),
+      supabase.from("pos_transactions").select("*, siswa(nama_lengkap)").order("created_at",{ascending:false}).limit(20),
+      supabase.from("school_settings").select("*").limit(1).single(),
+    ])
+    setInvoices(inv.data||[]); setStudents(sis.data||[]); setJadwal(jad.data||[]); setItems(it.data||[]); setPos(pt.data||[])
+    if(sch.data){ setSchool(sch.data); setSchoolForm(sch.data) }
   }
-  async function toggle(id:string,cur:string){
-    const {data:ex}=await supabase.from("pembayaran").select("*").eq("siswa_id",id).limit(1).maybeSingle()
-    if(ex) await supabase.from("pembayaran").update({status: cur==="lunas"?"pending":"lunas"}).eq("id",ex.id)
-    else await supabase.from("pembayaran").insert({siswa_id:id,status:"lunas",jumlah:350000})
+  const revenue=useMemo(()=>invoices.filter((i:any)=>i.status==="paid").reduce((a:any,b:any)=>a+b.total,0),[invoices])
+  const pending=useMemo(()=>invoices.filter((i:any)=>i.status!=="paid").reduce((a:any,b:any)=>a+b.total,0),[invoices])
+  const revenuePOS=useMemo(()=>pos.reduce((a:any,b:any)=>a+b.total,0),[pos])
+  const lowStock=useMemo(()=>items.filter((i:any)=>i.stock<=i.min_stock),[items])
+
+  function addToCart(item:any){
+    setCart(prev=>{
+      const ex=prev.find((c:any)=>c.id===item.id)
+      if(ex) return prev.map((c:any)=>c.id===item.id?{...c, qty:c.qty+1, subtotal:(c.qty+1)*c.sell_price}:c)
+      return [...prev, { id:item.id, name:item.name, sell_price:item.sell_price, qty:1, subtotal:item.sell_price }]
+    })
+  }
+  async function checkout(){
+    if(cart.length===0) return alert("Cart kosong")
+    const total=cart.reduce((a,b)=>a+b.subtotal,0)
+    const tenant = (await supabase.from("tenants").select("id").eq("slug","bimbel-star").single()).data
+    const branch = (await supabase.from("branches").select("id").eq("name","Cikarang Pusat").single()).data
+    const { data: trx, error } = await supabase.from("pos_transactions").insert({ tenant_id: tenant?.id, branch_id: branch?.id, invoice_no: `POS-${Date.now().toString().slice(-6)}`, siswa_id: selectedSiswa||null, total, payment_method:"cash", status:"paid" }).select().single()
+    if(error) return alert(error.message)
+    for(const c of cart){
+      await supabase.from("pos_items").insert({ transaction_id:trx.id, item_id:c.id, qty:c.qty, price:c.sell_price, subtotal:c.subtotal })
+      const it=items.find((i:any)=>i.id===c.id)
+      await supabase.from("inventory_items").update({ stock: (it.stock - c.qty) }).eq("id", c.id)
+      await supabase.from("inventory_movements").insert({ tenant_id: tenant?.id, item_id:c.id, type:"sale", qty:-c.qty, note:`POS ${trx.invoice_no}` })
+    }
+    setCart([]); load(); alert(`✓ POS Paid Rp ${total.toLocaleString()}`)
+  }
+  async function confirmPaid(id:any, total:any){
+    if(!confirm(`Konfirmasi lunas Rp ${total?.toLocaleString()} ?`)) return
+    const { error } = await supabase.from("invoices").update({ status:'paid', paid_at: new Date().toISOString() }).eq('id', id)
+    if(error) return alert(error.message)
+    const tenant = (await supabase.from("tenants").select("id").eq("slug","bimbel-star").single()).data
+    await supabase.from("finance_ledger").insert({ tenant_id: tenant?.id, type:'income', category:'SPP', amount:total, description:`SPP Lunas ${id}`, reference_id:id })
     load()
   }
-  async function add(){
-    if(!newName.trim()) return
-    const {data:ns}=await supabase.from("siswa").insert({nama_lengkap:newName,kelas:"6 SD",paket:"Reguler",nis:"BMBL"+Math.floor(Math.random()*9000)}).select().single()
-    if(ns) await supabase.from("pembayaran").insert({siswa_id:ns.id,status:"pending",jumlah:350000})
-    setNewName(""); setShowAdd(false); load()
+  async function saveSchool(){
+    const { error } = await supabase.from("school_settings").update({ name: schoolForm.name, alamat: schoolForm.alamat, rekening_bca: schoolForm.rekening_bca, rekening_bri: schoolForm.rekening_bri, wa_cs: schoolForm.wa_cs, logo_url: schoolForm.logo_url }).eq('id', school.id)
+    if(error) return alert(error.message)
+    setSchool(schoolForm); alert("✓ Setting sekolah disimpan! Header langsung ganti."); setTab("finance")
   }
 
-  const filtered = useMemo(()=>students.filter((s:any)=> (s.nama_lengkap||"").toLowerCase().includes(query.toLowerCase())),[students,query])
-  const lunas = students.filter((s:any)=>s.pembayaran?.[0]?.status==="lunas").length
-  const pending = students.length-lunas
-  const revenue = lunas*350000
-  const wa = (phone:string,name:string)=>{ window.open(`https://wa.me/${(phone||"").replace(/^0/,"62")}?text=Halo ${name}, tagihan Bimbel Cikarang Rp350.000 status PENDING. Transfer BCA 1234567890 a/n Bimbel Cikarang. Terima kasih 🙏`,"_blank") }
+  const allTabs=[
+    { id:"finance", label:"Finance", roles:["admin","super_admin","finance"] },
+    { id:"pos", label:"POS", roles:["admin","super_admin","finance"] },
+    { id:"inventory", label:"Inventory", roles:["admin","super_admin"] },
+    { id:"invoice", label:"Invoices", roles:["admin","super_admin","finance"] },
+    { id:"siswa", label:"Siswa", roles:["admin","super_admin","guru","finance"] },
+    { id:"jadwal", label:"Jadwal", roles:["admin","super_admin","guru"] },
+    { id:"reports", label:"Reports", roles:["admin","super_admin","finance"] },
+    { id:"settings", label:"⚙️ Settings", roles:["admin","super_admin"] },
+  ]
+  const visibleTabs = allTabs.filter(t=> role==="admin"||role==="super_admin"||t.roles.includes(role))
 
   return(
-    <div className="min-h-screen bg-[#08080C] text-white selection:bg-fuchsia-500/30">
-      <div className="pointer-events-none fixed inset-0 overflow-hidden">
-        <div className="absolute -top-[40%] -left-[20%] w-[90%] h-[80%] rounded-full blur-[120px] opacity-[0.60] bg-[radial-gradient(circle_at_center,_#8B5CF6_0%,_#6366F1_25%,_transparent_70%)]" />
-        <div className="absolute -top-[20%] -right-[30%] w-[80%] h-[70%] rounded-full blur-[130px] opacity-[0.50] bg-[radial-gradient(circle_at_center,_#EC4899_0%,_#F97316_35%,_transparent_70%)]" />
-        <div className="absolute bottom-[-30%] left-[10%] w-[70%] h-[60%] rounded-full blur-[140px] opacity-[0.35] bg-[radial-gradient(circle_at_center,_#06B6D4_0%,_#3B82F6_35%,_transparent_70%)]" />
+    <div className="min-h-screen bg-[#050508] text-white">
+      <div className="sticky top-0 z-20 border-b border-white/5 bg-[#08080C]/90 backdrop-blur"><div className="max-w-[1400px] mx-auto px-6 h-[64px] flex items-center justify-between"><div className="flex items-center gap-3">{school.logo_url? <img src={school.logo_url} className="w-8 h-8 rounded-xl object-cover border border-white/10"/> : <div className="w-8 h-8 rounded-xl bg-white text-black grid place-items-center font-black">{school.name?.[0]||"B"}</div>}<span className="font-bold">{school.name}</span><span className="text-[10px] px-3 py-1 rounded-full border bg-violet-500/15 text-violet-300 border-violet-500/20 hidden md:block">{role.toUpperCase()} • DB CONNECTED</span></div><button onClick={()=>{localStorage.clear(); router.push("/")}} className="h-9 px-4 rounded-full bg-white/10 text-sm">Logout</button></div></div>
+      <div className="max-w-[1400px] mx-auto p-6 lg:p-10 space-y-6">
+        <div className="flex gap-2 flex-wrap">{visibleTabs.map(t=><button key={t.id} onClick={()=>setTab(t.id)} className={`h-9 px-5 rounded-full text-[13px] font-medium capitalize ${tab===t.id?"bg-white text-black":"bg-white/[0.06] border border-white/10 hover:bg-white/10"}`}>{t.label}</button>)}</div>
+        <div className="grid md:grid-cols-4 gap-4">
+          <StatCard label="REVENUE PAID" value={`Rp ${(revenue/1000).toFixed(0)}k`} sub={`${invoices.filter((i:any)=>i.status==="paid").length} lunas`} />
+          <StatCard dark label="PENDING" value={`Rp ${(pending/1000).toFixed(0)}k`} sub={`${invoices.filter((i:any)=>i.status!=="paid").length} pending`} />
+          <StatCard dark label="POS REVENUE" value={`Rp ${(revenuePOS/1000).toFixed(0)}k`} sub={`${pos.length} trx • Stok low ${lowStock.length}`} />
+          <StatCard dark label="TOTAL SISWA" value={`${students.length}`} sub={`${school.alamat?.slice(0,18)} • Admin FULL`} />
+        </div>
+
+        {tab==="finance" && <Card className="p-0 overflow-hidden"><div className="p-5 border-b border-white/5 flex justify-between"><span className="font-bold">Finance — Konfirmasi Pembayaran SPP</span><span className="text-xs text-white/40">Klik Lunas untuk konfirmasi</span></div><div className="divide-y divide-white/5">{invoices.filter((i:any)=>i.status!=="paid").map((inv:any)=><div key={inv.id} className="px-6 py-4 flex justify-between items-center text-sm"><span>{inv.invoice_no} • {inv.siswa?.nama_lengkap} • <b>Rp {inv.total?.toLocaleString()}</b> • {inv.siswa?.phone}</span><button onClick={()=>confirmPaid(inv.id, inv.total)} className="h-8 px-4 rounded-full bg-emerald-500 text-black font-bold text-xs">Lunas ✓</button></div>)}{invoices.filter((i:any)=>i.status!=="paid").length===0&&<div className="p-10 text-center text-white/40 text-sm">Semua lunas ✓ Pending Rp 0</div>}</div></Card>}
+
+        {tab==="pos" && <div className="grid lg:grid-cols-[1fr_380px] gap-6">
+          <Card className="p-5"><h3 className="font-bold mb-4">POS — Klik Item</h3><div className="grid md:grid-cols-2 gap-3">{items.map((it:any)=><div key={it.id} onClick={()=>addToCart(it)} className="rounded-[12px] border border-white/5 bg-white/[0.03] p-4 flex justify-between cursor-pointer hover:bg-white/[0.06]"><div><p className="text-sm font-medium">{it.name}</p><p className="text-xs text-white/40">Stok {it.stock} • {it.sku}</p></div><p className="font-bold text-sm">Rp {it.sell_price.toLocaleString()}</p></div>)}</div></Card>
+          <Card className="p-5 bg-white text-black"><h3 className="font-black">Cart</h3><select value={selectedSiswa} onChange={e=>setSelectedSiswa(e.target.value)} className="mt-3 w-full h-9 rounded-full bg-black/5 border border-black/10 px-4 text-sm"><option value="">Umum</option>{students.map((s:any)=><option key={s.id} value={s.id}>{s.nama_lengkap}</option>)}</select><div className="mt-4 space-y-2">{cart.map((c:any)=><div key={c.id} className="flex justify-between text-sm border-b border-black/5 py-2"><span>{c.name} x{c.qty}</span><span className="font-bold">Rp {c.subtotal.toLocaleString()}</span></div>)}{cart.length===0&&<p className="text-xs opacity-60">Kosong</p>}</div><div className="mt-4 flex justify-between font-black border-t pt-3"><span>Total</span><span>Rp {cart.reduce((a,b)=>a+b.subtotal,0).toLocaleString()}</span></div><button onClick={checkout} className="mt-4 w-full h-11 rounded-full bg-black text-white font-bold">Bayar ✓</button></Card>
+        </div>}
+
+        {tab==="inventory" && <Card className="p-0 overflow-hidden"><div className="p-5 font-bold">Inventory</div><div className="divide-y divide-white/5">{items.map((it:any)=><div key={it.id} className={`px-6 py-4 flex justify-between text-sm ${it.stock<=it.min_stock?"bg-amber-500/10":""}`}><span>{it.name} • {it.category} • Margin Rp {(it.sell_price-it.buy_price).toLocaleString()}</span><span className="font-bold">Stok {it.stock}</span></div>)}</div></Card>}
+
+        {tab==="invoice" && <Card className="p-0 overflow-hidden"><div className="p-5 font-bold">All Invoices • SPP + POS</div><div className="divide-y divide-white/5 max-h-[500px] overflow-auto">{invoices.map((inv:any)=><div key={inv.id} className="px-6 py-3 flex justify-between text-sm"><span>{inv.invoice_no} • {inv.siswa?.nama_lengkap||"POS"} • Rp {inv.total?.toLocaleString()}</span><span className={inv.status==="paid"?"text-emerald-400":"text-amber-400"}>{inv.status} {inv.status==="paid"?"✓":"• "+inv.due_date?.slice(0,10)}</span></div>)}</div></Card>}
+
+        {tab==="siswa" && <Card className="p-0 overflow-hidden"><div className="p-5 font-bold">Siswa • {students.length}</div><div className="divide-y divide-white/5 max-h-[500px] overflow-auto">{students.map((s:any)=><div key={s.id} className="px-6 py-3 flex justify-between text-sm"><span>{s.nama_lengkap} • {s.kelas}</span><span className="text-white/40">{s.nis}</span></div>)}</div></Card>}
+
+        {tab==="jadwal" && <Card className="p-0 overflow-hidden"><div className="p-5 font-bold">Jadwal • {jadwal.length}</div><div className="divide-y divide-white/5">{jadwal.map((j:any)=><div key={j.id} className="px-6 py-3 flex justify-between text-sm"><span>{j.hari} {j.jam_mulai} • {j.kelas?.name}</span><span className="text-white/40">{j.ruang}</span></div>)}</div></Card>}
+
+        {tab==="reports" && <Card className="p-6"><h3 className="font-bold">Reports — {school.name}</h3><div className="mt-4 grid md:grid-cols-3 gap-3 text-sm"><div className="rounded-xl bg-white/5 p-4"><p className="text-white/40">SPP Paid</p><p className="text-xl font-black">Rp {revenue.toLocaleString()}</p></div><div className="rounded-xl bg-white/5 p-4"><p className="text-white/40">POS Revenue</p><p className="text-xl font-black">Rp {revenuePOS.toLocaleString()}</p></div><div className="rounded-xl bg-white text-black p-4"><p className="opacity-60">Total Revenue</p><p className="text-xl font-black">Rp {(revenue+revenuePOS).toLocaleString()}</p></div></div><div className="mt-6 rounded-xl bg-white/5 p-4 text-xs"><p>Rekening: {school.rekening_bca} | {school.rekening_bri}</p><p>WA: {school.wa_cs} | Alamat: {school.alamat}</p></div></Card>}
+
+        {tab==="settings" && <Card className="p-6"><h3 className="font-bold text-lg">⚙️ Settings Sekolah — Edit Nama, Logo, Rekening</h3><p className="text-xs text-white/40 mt-1">Ini langsung ngubah header BIMBEL STAR & semua invoice</p><div className="mt-6 grid md:grid-cols-2 gap-4">
+          <div><label className="text-xs text-white/60">Nama Sekolah</label><input value={schoolForm.name||""} onChange={e=>setSchoolForm({...schoolForm, name:e.target.value})} className="mt-1 w-full h-11 rounded-xl bg-white/[0.06] border border-white/10 px-4 text-sm"/></div>
+          <div><label className="text-xs text-white/60">Alamat</label><input value={schoolForm.alamat||""} onChange={e=>setSchoolForm({...schoolForm, alamat:e.target.value})} className="mt-1 w-full h-11 rounded-xl bg-white/[0.06] border border-white/10 px-4 text-sm"/></div>
+          <div><label className="text-xs text-white/60">Rekening BCA</label><input value={schoolForm.rekening_bca||""} onChange={e=>setSchoolForm({...schoolForm, rekening_bca:e.target.value})} placeholder="BCA 123456 a/n ..." className="mt-1 w-full h-11 rounded-xl bg-white/[0.06] border border-white/10 px-4 text-sm"/></div>
+          <div><label className="text-xs text-white/60">Rekening BRI / Lain</label><input value={schoolForm.rekening_bri||""} onChange={e=>setSchoolForm({...schoolForm, rekening_bri:e.target.value})} placeholder="BRI ..." className="mt-1 w-full h-11 rounded-xl bg-white/[0.06] border border-white/10 px-4 text-sm"/></div>
+          <div><label className="text-xs text-white/60">WA CS / Admin</label><input value={schoolForm.wa_cs||""} onChange={e=>setSchoolForm({...schoolForm, wa_cs:e.target.value})} placeholder="0812..." className="mt-1 w-full h-11 rounded-xl bg-white/[0.06] border border-white/10 px-4 text-sm"/></div>
+          <div><label className="text-xs text-white/60">Logo URL (paste link gambar)</label><input value={schoolForm.logo_url||""} onChange={e=>setSchoolForm({...schoolForm, logo_url:e.target.value})} placeholder="https://..." className="mt-1 w-full h-11 rounded-xl bg-white/[0.06] border border-white/10 px-4 text-sm"/></div>
+        </div><button onClick={saveSchool} className="mt-6 w-full md:w-auto px-8 h-11 rounded-full bg-white text-black font-bold">Simpan Settings ✓</button><div className="mt-8 rounded-xl bg-white/5 p-4 text-xs leading-relaxed"><p className="font-bold">Cara buat login Ortu/Guru:</p><p className="mt-2">1. Supabase Dashboard → Authentication → Users → Add User</p><p>2. Email: ibu-budi@gmail.com / Password: budi123 → Auto Confirm YES</p><p>3. Table Editor → profiles → insert: user_id (dari Auth), role='ortu', full_name='Ibu Budi'</p><p>4. Login di bimbel-saas.vercel.app dengan akun itu → otomatis cuma lihat jadwal & tagihan anak</p></div></Card>}
       </div>
-      <style>{`@import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;700;800&display=swap'); *{font-family:'Geist',sans-serif}`}</style>
-
-      <div className="relative flex min-h-screen">
-        <aside className="hidden lg:flex w-[300px] flex-col border-r border-white/[0.06] p-6 sticky top-0 h-screen backdrop-blur-xl bg-[#08080C]/40">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-[12px] bg-white text-black grid place-items-center font-black text-[16px] shadow-[0_0_20px_rgba(255,255,255,0.2)]">B</div>
-            <div><p className="font-extrabold leading-none tracking-tight">BIMBEL STAR</p><p className="text-[11px] text-white/40 tracking-widest">FULL FIGMA • LIVE</p></div>
-          </div>
-          <div className="mt-8 rounded-[20px] bg-white/[0.04] border border-white/[0.06] p-4">
-            <p className="text-[11px] uppercase tracking-widest text-white/40">Cabang Aktif</p>
-            <p className="font-semibold mt-1 flex items-center gap-2"><MapPin size={14}/> Cikarang Pusat</p>
-            <p className="text-[11px] text-white/40 mt-1">Jl. Industri No.12</p>
-          </div>
-          <nav className="mt-6 space-y-2">
-            {[
-              {id:"admin",label:"Admin Dashboard",icon:LayoutDashboard,desc:"12 siswa • overview"},
-              {id:"guru",label:"Portal Guru",icon:GraduationCap,desc:"Jadwal & Absensi"},
-              {id:"ortu",label:"Portal Orang Tua",icon:Users,desc:"Nilai & Laporan"},
-              {id:"finance",label:"Finance & Struk",icon:Wallet,desc:`Rp ${(revenue/1000000).toFixed(1)}jt • ${pending} pending`},
-            ].map((t:any)=>{const a=role===t.id; return <button key={t.id} onClick={()=>setRole(t.id as Role)} className={`w-full text-left px-4 py-3 rounded-[16px] flex gap-3 items-center transition-all ${a?"bg-white text-black shadow-[0_8px_24px_rgba(255,255,255,0.15)]":"text-white/60 hover:bg-white/[0.06] hover:text-white border border-transparent hover:border-white/5"}`}><div className={`w-9 h-9 rounded-full grid place-items-center ${a?"bg-black text-white":"bg-white/10"}`}><t.icon size={18}/></div><div className="flex-1 min-w-0"><p className="text-[13px] font-semibold leading-none">{t.label}</p><p className={`text-[11px] mt-1 truncate ${a?"text-black/60":"text-white/40"}`}>{t.desc}</p></div></button>})}
-          </nav>
-          <div className="mt-auto space-y-3">
-            <div className="rounded-[20px] bg-gradient-to-br from-violet-600 via-indigo-600 to-fuchsia-600 p-[1px]"><div className="rounded-[19px] bg-gradient-to-br from-violet-600 to-indigo-600 p-4"><p className="text-sm font-bold flex items-center gap-2"><Zap size={14}/> WA Auto-Nagih</p><p className="text-[11px] opacity-80 mt-1">{pending} tagihan pending • Blast 1 klik</p><button onClick={()=>students.filter((s:any)=>s.pembayaran?.[0]?.status!=="lunas").forEach((s:any)=>wa(s.phone,s.nama_lengkap))} className="mt-3 w-full h-10 bg-white text-black rounded-full text-xs font-bold hover:bg-white/90 transition">Blast {pending} WA Sekarang →</button></div></div>
-            <p className="text-[10px] text-center text-white/20">Supabase LIVE • {students.length} records • Figma</p>
-          </div>
-        </aside>
-
-        <main className="flex-1 min-w-0 pb-[110px] lg:pb-0">
-          <div className="sticky top-0 z-20 backdrop-blur-2xl bg-[#08080C]/70 border-b border-white/[0.06] px-6 lg:px-10 h-[68px] flex items-center justify-between">
-            <div className="flex items-center gap-4">
-              <h1 className="font-bold text-[15px] lg:text-[17px] tracking-tight capitalize flex items-center gap-2"><span className="hidden lg:flex w-8 h-8 rounded-full bg-white text-black place-items-center grid"><TrendingUp size={16}/></span>{role} — {students.length} siswa — Rp {(revenue/1000000).toFixed(1)}jt — LIVE</h1>
-              <span className="hidden lg:flex items-center gap-2 text-[11px] bg-emerald-500/15 text-emerald-300 border border-emerald-500/20 rounded-full px-3 py-1"><span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"/> SUPABASE CONNECTED</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <div className="hidden lg:flex bg-white/[0.06] border border-white/10 rounded-full px-4 h-10 items-center gap-2.5 w-[240px]"><Search size={14} className="text-white/30"/><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search siswa..." className="bg-transparent text-[13px] w-full placeholder:text-white/30 outline-none"/></div>
-              <button onClick={()=>setShowAdd(true)} className="w-10 h-10 rounded-full bg-white text-black grid place-items-center shadow-[0_4px_16px_rgba(255,255,255,0.2)] hover:scale-105 transition"><Plus size={18}/></button>
-            </div>
-          </div>
-
-          <div className="p-6 lg:p-10 max-w-[1400px] mx-auto space-y-6">
-            <div className="grid grid-cols-2 lg:grid-cols-12 gap-4">
-              <div className="col-span-2 lg:col-span-7 rounded-[28px] p-[1px] bg-gradient-to-b from-white/15 to-transparent"><div className="rounded-[27px] bg-[#121218] p-7 lg:p-8 relative overflow-hidden"><div className="absolute -right-10 -top-10 w-[200px] h-[200px] rounded-full bg-gradient-to-br from-violet-600/30 to-transparent blur-[30px]"/><p className="text-[11px] uppercase tracking-[0.2em] text-white/40">Total Revenue (Live Supabase)</p><p className="text-[42px] lg:text-[52px] font-black tracking-tighter mt-3 leading-none">Rp {revenue.toLocaleString('id-ID')}</p><div className="mt-5 flex flex-wrap gap-2.5"><span className="bg-white text-black rounded-full px-4 py-1.5 text-[11px] font-bold flex items-center gap-1.5"><CheckCircle2 size={12}/> LIVE DB</span><span className="bg-white/[0.08] border border-white/10 rounded-full px-4 py-1.5 text-[11px]">{lunas}/{students.length} lunas • {Math.round(lunas/Math.max(1,students.length)*100)}%</span><span className="bg-emerald-500/15 text-emerald-300 border border-emerald-500/20 rounded-full px-4 py-1.5 text-[11px]">+Rp {(pending*350000).toLocaleString()} potensi</span></div></div></div>
-              <div className="col-span-1 lg:col-span-2 rounded-[24px] bg-white text-black p-6 flex flex-col justify-between"><div><p className="text-[11px] uppercase tracking-widest opacity-60">Total Siswa</p><p className="text-[42px] font-extrabold tracking-tighter mt-1">{students.length}</p></div><p className="text-[11px] opacity-60 flex items-center gap-1"><Users size={12}/> Cikarang Pusat</p></div>
-              <div className="col-span-1 lg:col-span-3 rounded-[24px] bg-[#1A1A22] border border-white/10 p-6 flex flex-col justify-between"><p className="text-[11px] uppercase tracking-widest text-white/40">Pending Tagihan</p><p className="text-[42px] font-extrabold tracking-tighter mt-1 text-amber-300">{pending}</p><button onClick={()=>students.filter((s:any)=>s.pembayaran?.[0]?.status!=="lunas").forEach((s:any)=>wa(s.phone,s.nama_lengkap))} className="mt-3 h-9 rounded-full bg-amber-400 text-black text-xs font-bold">Tagih Semua →</button></div>
-            </div>
-
-            <div className="grid lg:grid-cols-[1fr_380px] gap-6">
-              <div className="rounded-[24px] border border-white/[0.06] bg-[#121218]/70 backdrop-blur-xl overflow-hidden">
-                <div className="p-6 flex justify-between items-center border-b border-white/[0.06]"><h3 className="font-semibold flex items-center gap-2"><Clock size={16} className="text-white/40"/> Siswa Cikarang — Supabase Live ({filtered.length})</h3><span className="text-[11px] bg-white/5 border border-white/10 rounded-full px-3 py-1">Auto-sync</span></div>
-                <div className="divide-y divide-white/[0.04] max-h-[640px] overflow-auto">
-                  {filtered.map((s:any)=>{const isL=s.pembayaran?.[0]?.status==="lunas"; return (
-                    <div key={s.id} className="group flex items-center gap-4 px-6 py-[14px] hover:bg-white/[0.04] transition">
-                      <div className="w-10 h-10 rounded-full bg-gradient-to-br from-violet-500 to-fuchsia-500 grid place-items-center font-bold text-[13px] shadow-[0_4px_12px_rgba(139,92,246,0.3)]">{(s.nama_lengkap||"?")[0]}</div>
-                      <div className="flex-1 min-w-0"><p className="text-[14px] font-medium truncate">{s.nama_lengkap} — {s.kelas} — {isL?"LUNAS":"PENDING"}</p><p className="text-[11px] text-white/40">{s.nis||s.id.slice(0,6)} • {s.paket||"Reguler"}</p></div>
-                      <div className={`hidden lg:flex text-[11px] px-2.5 py-1 rounded-full border font-bold ${isL?"bg-emerald-500/15 text-emerald-300 border-emerald-500/20":"bg-amber-500/15 text-amber-300 border-amber-500/20"}`}>{isL?"LUNAS":"PENDING"}</div>
-                      <button onClick={()=>toggle(s.id,s.pembayaran?.[0]?.status)} className="h-8 px-3.5 rounded-full bg-white/[0.06] hover:bg-white hover:text-black border border-white/10 text-[11px] font-medium transition">Toggle</button>
-                      <button onClick={()=>wa(s.phone,s.nama_lengkap)} className="w-8 h-8 rounded-full bg-[#25D366] hover:bg-[#20bd5a] text-white grid place-items-center shadow-[0_4px_10px_rgba(37,211,102,0.3)] transition group-hover:scale-110"><MessageCircle size={14}/></button>
-                    </div>
-                  )})}
-                </div>
-              </div>
-
-              <div className="space-y-4">
-                <div className="rounded-[24px] border border-white/10 bg-[#121218] p-6">
-                  <h4 className="font-semibold text-[14px] flex items-center gap-2"><Receipt size={16}/> Struk Thermal Printer</h4>
-                  <p className="text-[11px] text-white/40 mt-1">Support Epson TM-T20 / Bluetooth 58mm & 80mm</p>
-                  <div className="flex gap-2 mt-4">
-                    <button onClick={()=>setPaper("58")} className={`flex-1 h-10 rounded-full text-xs font-bold border transition ${paper==="58"?"bg-white text-black border-white":"bg-white/5 text-white/60 border-white/10"}`}>58mm</button>
-                    <button onClick={()=>setPaper("80")} className={`flex-1 h-10 rounded-full text-xs font-bold border transition ${paper==="80"?"bg-white text-black border-white":"bg-white/5 text-white/60 border-white/10"}`}>80mm</button>
-                  </div>
-                  <div className={`mt-5 bg-white text-black font-mono text-[11px] p-4 rounded-[14px] shadow-[0_12px_32px_rgba(0,0,0,0.4)] leading-[1.5] ${paper==="58"?"max-w-[280px]":"max-w-[360px]"} mx-auto`}>
-                    <div className="text-center font-bold text-[12px]">BIMBEL CIKARANG PUSAT<br/><span className="font-normal text-[10px]">Jl. Industri No.12 Cikarang</span><br/>------------------------------</div>
-                    <div className="mt-2">No: INV-{(students[0] as any)?.id?.slice(0,6)||"A1B2C3"}<br/>Tgl: {new Date().toLocaleDateString('id-ID')}<br/>Siswa: {(students[0] as any)?.nama_lengkap||"Aisyah Putri"}<br/>Kelas: 5 SD - Reguler<br/>------------------------------</div>
-                    <div className="flex justify-between"><span>Biaya Bimbel</span><span>Rp350.000</span></div>
-                    <div className="flex justify-between font-bold text-[12px] mt-1"><span>TOTAL</span><span>Rp350.000</span></div>
-                    <div className="mt-1">Status: LUNAS ✓<br/>------------------------------</div>
-                    <div className="text-center mt-2 text-[10px]">Terima kasih 🙏<br/>WA: 0812-xxxx-xxxx<br/>*Simpan sebagai bukti bayar</div>
-                  </div>
-                  <button onClick={()=>window.print()} className="mt-4 w-full h-11 rounded-full bg-white text-black font-bold text-[13px] flex items-center justify-center gap-2"><Receipt size={14}/> Cetak Struk {paper}</button>
-                </div>
-              </div>
-            </div>
-          </div>
-        </main>
-      </div>
-      <div className="lg:hidden fixed bottom-0 inset-x-0 p-3 z-30"><div className="mx-auto max-w-[500px] rounded-[24px] bg-[#14141A]/90 backdrop-blur-2xl border border-white/10 p-2 flex gap-1.5 shadow-[0_16px_40px_rgba(0,0,0,0.5)]">{( ["admin","guru","ortu","finance"] as any[]).map(r=>{const a=role===r; return <button key={r} onClick={()=>setRole(r)} className={`flex-1 h-[56px] rounded-[16px] capitalize text-[12px] font-semibold transition-all ${a?"bg-white text-black shadow-[0_4px_16px_rgba(255,255,255,0.3)]":"text-white/60"}`}>{r}</button>})}</div></div>
-      {showAdd && <div className="fixed inset-0 z-50 grid place-items-center p-4"><div className="absolute inset-0 bg-black/70 backdrop-blur-xl" onClick={()=>setShowAdd(false)}/><div className="relative w-full max-w-[420px] rounded-[28px] bg-[#14141A] border border-white/10 p-7 shadow-[0_24px_64px_rgba(0,0,0,0.6)]"><p className="font-bold text-[16px]">Tambah Siswa Baru</p><p className="text-[12px] text-white/40 mt-1">Auto bikin invoice Rp350.000 PENDING</p><input value={newName} onChange={e=>setNewName(e.target.value)} placeholder="Nama lengkap siswa" className="mt-5 w-full h-[56px] rounded-[16px] bg-white/[0.06] border border-white/10 px-4 outline-none focus:border-violet-500/50 text-[14px]"/><div className="flex gap-3 mt-5"><button onClick={()=>setShowAdd(false)} className="flex-1 h-[56px] rounded-[16px] bg-white/10 text-[14px]">Batal</button><button onClick={add} className="flex-1 h-[56px] rounded-[16px] bg-white text-black font-bold text-[14px]">Tambah + Invoice</button></div></div></div>}
     </div>
   )
 }
